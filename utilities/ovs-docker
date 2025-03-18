@@ -118,27 +118,43 @@ add_port () {
     fi
 
     create_netns_link
-
-    # Create a veth pair.
-    ID=`uuidgen | sed 's/-//g'`
-    PORTNAME="${ID:0:13}"
-    ip link add "${PORTNAME}_l" type veth peer name "${PORTNAME}_c"
+    
+    # Create a veth pair with human-readable names.
+    # We want the names to include the container and interface names.
+    # Linux limits interface names to 15 characters.
+    # We reserve 2 characters for the suffix ("-h" or "-c"), leaving 13.
+    # If possible, build the base as "<container_part>-<INTERFACE>".
+    if [ ${#INTERFACE} -le 12 ]; then
+        available=$((12 - ${#INTERFACE}))
+    else
+        available=0
+    fi
+    if [ $available -gt 0 ]; then
+        container_part=${CONTAINER:0:$available}
+        PORTNAME_BASE="${container_part}-${INTERFACE}"
+    else
+        PORTNAME_BASE="${INTERFACE}"
+    fi
+    # Append suffixes for host and container endpoints and enforce 15-character limit.
+    HOST_PORT=$(echo "${PORTNAME_BASE}-h" | cut -c1-15)
+    CONT_PORT=$(echo "${PORTNAME_BASE}-c" | cut -c1-15)
+    ip link add "${HOST_PORT}" type veth peer name "${CONT_PORT}"
 
     # Add one end of veth to OVS bridge.
-    if ovs_vsctl --may-exist add-port "$BRIDGE" "${PORTNAME}_l" \
-       -- set interface "${PORTNAME}_l" \
+    if ovs_vsctl --may-exist add-port "$BRIDGE" "${HOST_PORT}" \
+       -- set interface "${HOST_PORT}" \
        external_ids:container_id="$CONTAINER" \
        external_ids:container_iface="$INTERFACE"; then :; else
-        echo >&2 "$UTIL: Failed to add "${PORTNAME}_l" port to bridge $BRIDGE"
-        ip link delete "${PORTNAME}_l"
+        echo >&2 "$UTIL: Failed to add port ${HOST_PORT} to bridge $BRIDGE"
+        ip link delete "${HOST_PORT}"
         exit 1
     fi
 
-    ip link set "${PORTNAME}_l" up
+    ip link set "${HOST_PORT}" up
 
-    # Move "${PORTNAME}_c" inside the container and changes its name.
-    ip link set "${PORTNAME}_c" netns "$PID"
-    ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
+    # Move "${CONT_PORT}_c" inside the container and changes its name.
+    ip link set "${CONT_PORT}" netns "$PID"
+    ip netns exec "$PID" ip link set dev "${CONT_PORT}" name "$INTERFACE"
     ip netns exec "$PID" ip link set "$INTERFACE" up
 
     if [ -n "$MTU" ]; then
