@@ -152,6 +152,14 @@ add_port () {
         HOST_PORT=$(echo "${PORTNAME_BASE}-h" | cut -c1-15)
         CONT_PORT=$(echo "${PORTNAME_BASE}-c" | cut -c1-15)
 
+         # Deconflict in case the generated port name already exists.
+         counter=1
+         while ip link show "$HOST_PORT" &>/dev/null; do
+             HOST_PORT=$(echo "${PORTNAME_BASE}${counter}-h" | cut -c1-15)
+             CONT_PORT=$(echo "${PORTNAME_BASE}${counter}-c" | cut -c1-15)
+             counter=$((counter+1))
+         done
+
         ip link add "${HOST_PORT}" type veth peer name "${CONT_PORT}"
     fi
 
