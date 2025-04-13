@@ -65,6 +65,8 @@ enum raft_role {
     RAFT_LEADER
 };
 
+static const char *raft_role_to_string(enum raft_role);
+
 /* Flags for unit tests. */
 enum raft_failure_test {
     FT_NO_TEST,
@@ -375,6 +377,11 @@ static void raft_send_append_request(struct raft *,
                                      struct raft_server *, unsigned int n,
                                      const char *comment);
 
+static void raft_role_transition_at(struct raft *, enum raft_role,
+                                    const char *func, const char *source);
+#define raft_role_transition(raft, role) \
+    raft_role_transition_at(raft, role, __func__, OVS_SOURCE_LOCATOR)
+
 static void raft_become_leader(struct raft *);
 static void raft_become_follower(struct raft *);
 static void raft_reset_election_timer(struct raft *);
@@ -436,7 +443,7 @@ raft_alloc(void)
     hmap_node_nullify(&raft->hmap_node);
     hmap_init(&raft->servers);
     raft->log_start = raft->log_end = 1;
-    raft->role = RAFT_FOLLOWER;
+    raft_role_transition(raft, RAFT_FOLLOWER);
     sset_init(&raft->remote_addresses);
     raft->join_timeout = LLONG_MAX;
     ovs_list_init(&raft->waiters);
@@ -1370,8 +1377,29 @@ raft_send_remove_server_requests(struct raft *raft)
             raft_send(raft, &rpc);
         }
     }
+}
 
-    raft->leave_timeout = time_msec() + raft->election_timer;
+/* Sends requests required to leave the cluster and schedules the next time
+ * this function should be called. */
+static void
+raft_send_leave_requests(struct raft *raft)
+{
+    long long int delay = raft->election_timer;
+
+    if (raft->role == RAFT_LEADER) {
+        raft_transfer_leadership(raft, "this server is leaving the cluster");
+        raft_become_follower(raft);
+        /* Not sending the RemoveServerRequest right away, because a new
+         * leader has to be elected first for the request to be successful.
+         * But setting a shorter delay to avoid waiting for too long when
+         * the leader re-election is fast.  Randomized to avoid two servers
+         * bouncing the leadership between each other and never actually
+         * leaving. */
+        delay = delay / 10 + random_range(delay / 10);
+    } else {
+        raft_send_remove_server_requests(raft);
+    }
+    raft->leave_timeout = time_msec() + delay;
 }
 
 /* Attempts to start 'raft' leaving its cluster.  The caller can check progress
@@ -1385,10 +1413,7 @@ raft_leave(struct raft *raft)
     VLOG_INFO(SID_FMT": starting to leave cluster "CID_FMT,
               SID_ARGS(&raft->sid), CID_ARGS(&raft->cid));
     raft->leaving = true;
-    raft_transfer_leadership(raft, "this server is leaving the cluster");
-    raft_become_follower(raft);
-    raft_send_remove_server_requests(raft);
-    raft->leave_timeout = time_msec() + raft->election_timer;
+    raft_send_leave_requests(raft);
 }
 
 /* Returns true if 'raft' is currently attempting to leave its cluster. */
@@ -1860,10 +1885,6 @@ raft_start_election(struct raft *raft, bool is_prevote,
     /* Leadership transfer doesn't use pre-vote. */
     ovs_assert(!is_prevote || !leadership_transfer);
 
-    if (raft->leaving) {
-        return;
-    }
-
     struct raft_server *me = raft_find_server(raft, &raft->sid);
     if (!me) {
         return;
@@ -1876,8 +1897,8 @@ raft_start_election(struct raft *raft, bool is_prevote,
     ovs_assert(raft->role != RAFT_LEADER);
 
     raft->leader_sid = UUID_ZERO;
-    raft->role = RAFT_CANDIDATE;
     raft->prevote_passed = !is_prevote;
+    raft_role_transition(raft, RAFT_CANDIDATE);
 
     if (is_prevote || leadership_transfer) {
         /* If there was no leader elected since last election, we know we are
@@ -1987,6 +2008,12 @@ raft_conn_should_stay_open(struct raft *raft, struct raft_conn *conn)
      * that are supposed to be part of the cluster we're joining. */
     if (raft->joining && sset_contains(&raft->remote_addresses,
                                        jsonrpc_session_get_name(conn->js))) {
+        return true;
+    }
+
+    /* Keep the connection until we send a RemoveServerReply. */
+    if (raft->remove_server
+        && uuid_equals(&conn->sid, &raft->remove_server->sid)) {
         return true;
     }
 
@@ -2116,6 +2143,8 @@ raft_run(struct raft *raft)
                     count ++;
                 }
             }
+            VLOG_DBG("%d out of %"PRIuSIZE" servers replied",
+                      count, hmap_count(&raft->servers));
             if (count >= hmap_count(&raft->servers) / 2) {
                 HMAP_FOR_EACH (server, hmap_node, &raft->servers) {
                     server->replied = false;
@@ -2132,7 +2161,7 @@ raft_run(struct raft *raft)
     }
 
     if (raft->leaving && time_msec() >= raft->leave_timeout) {
-        raft_send_remove_server_requests(raft);
+        raft_send_leave_requests(raft);
     }
 
     if (raft->joining && time_msec() >= raft->join_timeout) {
@@ -2170,9 +2199,14 @@ raft_run(struct raft *raft)
         raft_reset_ping_timer(raft);
     }
 
-    uint64_t interval = raft->joining
-                        ? RAFT_JOIN_TIMEOUT_MS
-                        : RAFT_TIMER_THRESHOLD(raft->election_timer);
+    uint64_t interval = RAFT_TIMER_THRESHOLD(raft->election_timer);
+
+    if (raft->joining) {
+        interval = RAFT_JOIN_TIMEOUT_MS;
+    } else if (uuid_is_zero(&raft->leader_sid)) {
+        /* There are no heartbeats to handle when there is no leader. */
+        interval = raft->election_timer;
+    }
     cooperative_multitasking_set(
         &raft_run_cb, (void *) raft, time_msec(),
         interval + interval / 10, "raft_run");
@@ -2440,7 +2474,7 @@ raft_command_execute__(struct raft *raft, const struct json *data,
                        const struct json *servers, uint64_t election_timer,
                        const struct uuid *prereq, struct uuid *result)
 {
-    if (raft->joining || raft->leaving || raft->left || raft->failed) {
+    if (raft->joining || raft->left || raft->failed) {
         return raft_command_create_completed(RAFT_CMD_SHUTDOWN);
     }
 
@@ -2778,7 +2812,7 @@ raft_become_follower(struct raft *raft)
         return;
     }
 
-    raft->role = RAFT_FOLLOWER;
+    raft_role_transition(raft, RAFT_FOLLOWER);
     raft_reset_election_timer(raft);
 
     /* Notify clients about lost leadership.
@@ -2895,6 +2929,26 @@ raft_set_leader(struct raft *raft, const struct uuid *sid)
     raft->candidate_retrying = false;
 }
 
+static const char *
+raft_role_to_string(enum raft_role role)
+{
+    switch (role) {
+    case RAFT_FOLLOWER:  return "follower";
+    case RAFT_CANDIDATE: return "candidate";
+    case RAFT_LEADER:    return "leader";
+    default: return "<error>";
+    }
+}
+
+static void
+raft_role_transition_at(struct raft *raft, enum raft_role role,
+                        const char *func, const char *source)
+{
+    VLOG_DBG("%s(%s): role transition: %s --> %s", func, source,
+             raft_role_to_string(raft->role), raft_role_to_string(role));
+    raft->role = role;
+}
+
 static void
 raft_become_leader(struct raft *raft)
 {
@@ -2906,7 +2960,7 @@ raft_become_leader(struct raft *raft)
                  raft->n_votes, hmap_count(&raft->servers));
 
     ovs_assert(raft->role != RAFT_LEADER);
-    raft->role = RAFT_LEADER;
+    raft_role_transition(raft, RAFT_LEADER);
     raft->election_won = time_msec();
     raft_set_leader(raft, &raft->sid);
     raft_reset_election_timer(raft);
@@ -3367,7 +3421,7 @@ raft_update_leader(struct raft *raft, const struct uuid *sid)
          * least as large as the candidate's current term, then the
          * candidate recognizes the leader as legitimate and returns to
          * follower state. */
-        raft->role = RAFT_FOLLOWER;
+        raft_role_transition(raft, RAFT_FOLLOWER);
     }
     return true;
 }
@@ -4143,6 +4197,14 @@ raft_handle_remove_server_request(struct raft *raft,
         return;
     }
 
+    /* Check for the server already being removed. */
+    if (raft->remove_server
+        && uuid_equals(&rq->sid, &raft->remove_server->sid)) {
+        raft_send_remove_server_reply(raft, rq,
+                                      false, RAFT_SERVER_IN_PROGRESS);
+        return;
+    }
+
     /* If the server isn't configured, report that. */
     target = raft_find_server(raft, &rq->sid);
     if (!target) {
@@ -4877,11 +4939,7 @@ raft_unixctl_status(struct unixctl_conn *conn,
         }
     }
 
-    ds_put_format(&s, "Role: %s\n",
-                  raft->role == RAFT_LEADER ? "leader"
-                  : raft->role == RAFT_CANDIDATE ? "candidate"
-                  : raft->role == RAFT_FOLLOWER ? "follower"
-                  : "<error>");
+    ds_put_format(&s, "Role: %s\n", raft_role_to_string(raft->role));
     ds_put_format(&s, "Term: %"PRIu64"\n", raft->term);
     raft_put_sid("Leader", &raft->leader_sid, raft, &s);
     raft_put_sid("Vote", &raft->vote, raft, &s);

@@ -20,11 +20,14 @@
 # packets sent by the kernel to ovs-vswitchd. By default, it will show all
 # upcall events, which looks something like this:
 #
-# TIME               CPU  COMM      PID      DPIF_NAME          TYPE PKT_LEN...
-# 5952147.003848809  2    handler4  1381158  system@ovs-system  0    98     132
-# 5952147.003879643  2    handler4  1381158  system@ovs-system  0    70     160
-# 5952147.003914924  2    handler4  1381158  system@ovs-system  0    98     152
+# TIME               CPU  COMM      PID      PORT_NAME                TYPE ..
+# 5952147.003848809  2    handler4  1381158  eth0 (system@ovs-system)  0
+# 5952147.003879643  2    handler4  1381158  eth0 (system@ovs-system)  0
+# 5952147.003914924  2    handler4  1381158  eth0 (system@ovs-system)  0
 #
+# Also, upcalls dropped by the kernel (e.g: because the netlink buffer is full)
+# are reported. This requires the kernel version to be greater or equal to
+# 5.14.
 # In addition, the packet and flow key data can be dumped. This can be done
 # using the --packet-decode and --flow-key decode options (see below).
 #
@@ -59,13 +62,16 @@
 #                            Set maximum packet size to capture, default 64
 #      -w PCAP_FILE, --pcap PCAP_FILE
 #                            Write upcall packets to specified pcap file.
+#      -r, --result {error,ok,any}
+#                            Display only events with the given result,
+#                            default: any
 #
 # The following is an example of how to use the script on the running
 # ovs-vswitchd process with a packet and flow key dump enabled:
 #
 #  $ ./upcall_monitor.py --packet-decode decode --flow-key-decode nlraw \
 #      --packet-size 128 --flow-key-size 256
-#  TIME               CPU  COMM             PID        DPIF_NAME          ...
+#  TIME               CPU  COMM             PID        PORT_NAME          ...
 #  5953013.333214231  2    handler4         1381158    system@ovs-system  ...
 #    Flow key size 132 bytes, size captured 132 bytes.
 #      nla_len 8, nla_type OVS_KEY_ATTR_RECIRC_ID[20], data: 00 00 00 00
@@ -111,27 +117,42 @@
 #
 
 from bcc import BPF, USDT, USDTException
-from os.path import exists
-from scapy.all import hexdump, wrpcap
+from os.path import exists, join
+from scapy import VERSION as scapy_version
 from scapy.layers.l2 import Ether
+from usdt_lib import DpPortMapping
 
 import argparse
 import psutil
 import re
 import struct
 import sys
-import time
+
+(scapy_mayor, scapy_minor, _) = scapy_version.split(".", 2)
+(scapy_mayor, scapy_minor) = (int(scapy_mayor), int(scapy_minor))
+
+scapy_supports_pcap_iface = False
+if scapy_mayor < 2 or (scapy_mayor == 2 and scapy_minor) <= 4:
+    from scapy.all import hexdump, wrpcap
+else:
+    from scapy.all import hexdump, PcapNgWriter
+    if scapy_mayor > 2 or (scapy_mayor == 2 and scapy_minor >= 6):
+        # Support for setting the iface name in the pcapng file was added in:
+        # 56b4fa4a pcapng enhancements (idb,epb) and some fixes (#4342)
+        scapy_supports_pcap_iface = True
 
 #
 # Actual eBPF source code
 #
 ebpf_source = """
-#include <linux/sched.h>
+#include <linux/netdevice.h>
+#include <linux/skbuff.h>
 
 #define MAX_PACKET <MAX_PACKET_VAL>
 #define MAX_KEY    <MAX_KEY_VAL>
 
 struct event_t {
+    int result;
     u32 cpu;
     u32 pid;
     u32 upcall_type;
@@ -140,29 +161,37 @@ struct event_t {
     u64 key_size;
     char comm[TASK_COMM_LEN];
     char dpif_name[32];
+    char dev_name[16];
     unsigned char pkt[MAX_PACKET];
     unsigned char key[MAX_KEY];
 };
 BPF_RINGBUF_OUTPUT(events, <BUFFER_PAGE_CNT>);
 BPF_TABLE("percpu_array", uint32_t, uint64_t, dropcnt, 1);
 
+static
+void report_missed_event() {
+    uint32_t type = 0;
+    uint64_t *value = dropcnt.lookup(&type);
+    if (value)
+        __sync_fetch_and_add(value, 1);
+}
+
+#if <INSTALL_OVS_UPCALL_RECV_PROBE>
 int do_trace(struct pt_regs *ctx) {
     uint64_t addr;
     uint64_t size;
 
     struct event_t *event = events.ringbuf_reserve(sizeof(struct event_t));
     if (!event) {
-        uint32_t type = 0;
-        uint64_t *value = dropcnt.lookup(&type);
-        if (value)
-            __sync_fetch_and_add(value, 1);
-
+        report_missed_event();
         return 1;
     }
 
     event->ts = bpf_ktime_get_ns();
     event->cpu =  bpf_get_smp_processor_id();
     event->pid = bpf_get_current_pid_tgid();
+    event->result = 0;
+    event->dev_name[0] = 0;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
     bpf_usdt_readarg(1, ctx, &addr);
@@ -190,53 +219,160 @@ int do_trace(struct pt_regs *ctx) {
     events.ringbuf_submit(event, 0);
     return 0;
 };
+#endif
+
+#if <INSTALL_OVS_UPCALL_DROP_PROBE>
+struct inflight_upcall {
+    u32 cpu;
+    u32 upcall_type;
+    u64 ts;
+    struct sk_buff *skb;
+    char dpif_name[32];
+};
+BPF_HASH(inflight_upcalls, u64, struct inflight_upcall);
+
+TRACEPOINT_PROBE(openvswitch, ovs_dp_upcall)
+{
+    u64 pid = bpf_get_current_pid_tgid();
+    struct inflight_upcall upcall = {};
+
+    upcall.cpu = bpf_get_smp_processor_id();
+    upcall.ts = bpf_ktime_get_ns();
+    upcall.upcall_type = args->upcall_cmd;
+    upcall.skb = args->skbaddr;
+    TP_DATA_LOC_READ_CONST(&upcall.dpif_name, dp_name,
+                           sizeof(upcall.dpif_name));
+
+    inflight_upcalls.insert(&pid, &upcall);
+    return 0;
+}
+
+int kretprobe__ovs_dp_upcall(struct pt_regs *ctx)
+{
+    u64 pid = bpf_get_current_pid_tgid();
+    struct inflight_upcall *upcall;
+    int ret = PT_REGS_RC(ctx);
+    struct net_device *dev;
+    u64 size;
+
+    upcall = inflight_upcalls.lookup(&pid);
+    inflight_upcalls.delete(&pid);
+    if (!upcall)
+        return 0;
+
+    /* Successfull upcalls are reported in the USDT probe. */
+    if (!ret)
+        return 0;
+
+    struct event_t *event = events.ringbuf_reserve(sizeof(struct event_t));
+    if (!event) {
+        report_missed_event();
+        return 1;
+    }
+
+    event->ts = upcall->ts;
+    event->cpu = upcall->cpu;
+    event->pid = pid;
+    event->result = ret;
+    __builtin_memcpy(&event->dpif_name, &upcall->dpif_name, 32);
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    event->pkt_size = upcall->skb->len;
+    event->upcall_type = upcall->upcall_type;
+    event->key_size = 0;
+    bpf_probe_read(&dev, sizeof(upcall->skb->dev),
+                   ((char *)upcall->skb + offsetof(struct sk_buff, dev)));
+    bpf_probe_read_kernel(&event->dev_name, 16, dev->name);
+
+    size = upcall->skb->len - upcall->skb->data_len;
+    if (size > MAX_PACKET)
+        size = MAX_PACKET;
+
+    bpf_probe_read_kernel(event->pkt, size, upcall->skb->data);
+    events.ringbuf_submit(event, 0);
+    return 0;
+}
+#endif
 """
+
+pcap_writer = None
+
+
+#
+# format_key()
+#
+def format_key(event, decode_dump):
+    lines = []
+    if event.key_size < options.flow_key_size:
+        key_len = event.key_size
+    else:
+        key_len = options.flow_key_size
+
+    if not key_len:
+        return []
+
+    if options.flow_key_decode != 'none':
+        lines.append("  Flow key size {} bytes, size captured {} bytes.".
+                     format(event.key_size, key_len))
+
+    if options.flow_key_decode == 'hex':
+        #
+        # Abuse scapy's hex dump to dump flow key
+        #
+        lines.extend(re.sub('^', ' ' * 4,
+            hexdump(
+                Ether(bytes(event.key)[:key_len]),
+                dump=True),
+            flags=re.MULTILINE).split("\n"))
+
+    if options.flow_key_decode == "nlraw":
+        lines.extend(decode_dump)
+
+    return lines
 
 
 #
 # print_event()
 #
 def print_event(ctx, data, size):
-    event = b['events'].event(data)
-    print("{:<18.9f} {:<4} {:<16} {:<10} {:<32} {:<4} {:<10} {:<10}".
-          format(event.ts / 1000000000,
-                 event.cpu,
-                 event.comm.decode("utf-8"),
-                 event.pid,
-                 event.dpif_name.decode("utf-8"),
-                 event.upcall_type,
-                 event.pkt_size,
-                 event.key_size))
+    global pcap_writer
+
+    event = b["events"].event(data)
+    dp = event.dpif_name.decode("utf-8")
+
+    nla, key_dump = decode_nlm(
+        bytes(event.key)[: min(event.key_size, options.flow_key_size)]
+    )
+    if event.dev_name:
+        port = event.dev_name.decode("utf-8")
+    elif "OVS_KEY_ATTR_IN_PORT" in nla:
+        port_no = struct.unpack("=I", nla["OVS_KEY_ATTR_IN_PORT"])[0]
+        port = dp_map.get_port_name(dp.partition("@")[-1], port_no)
+        if not port:
+            port = str(port_no)
+    else:
+        port = "Unknown"
+
+    print(
+        "{:<18.9f} {:<4} {:<16} {:<10} {:<40} {:<4} {:<10} {:<12} {:<8}".
+        format(
+            event.ts / 1000000000,
+            event.cpu,
+            event.comm.decode("utf-8"),
+            event.pid,
+            "{} ({})".format(port, dp),
+            event.upcall_type,
+            event.pkt_size,
+            event.key_size,
+            event.result,
+        )
+    )
 
     #
     # Dump flow key information
     #
-    if event.key_size < options.flow_key_size:
-        key_len = event.key_size
-    else:
-        key_len = options.flow_key_size
-
-    if options.flow_key_decode != 'none':
-        print("  Flow key size {} bytes, size captured {} bytes.".
-              format(event.key_size, key_len))
-
-    if options.flow_key_decode == 'hex':
-        #
-        # Abuse scapy's hex dump to dump flow key
-        #
-        print(re.sub('^', ' ' * 4, hexdump(Ether(bytes(event.key)[:key_len]),
-                                           dump=True),
-                     flags=re.MULTILINE))
-
-    if options.flow_key_decode == 'nlraw':
-        nla = decode_nlm(bytes(event.key)[:key_len])
-    else:
-        nla = decode_nlm(bytes(event.key)[:key_len], dump=False)
-
-    if "OVS_KEY_ATTR_IN_PORT" in nla:
-        port = struct.unpack("=I", nla["OVS_KEY_ATTR_IN_PORT"])[0]
-    else:
-        port = "Unknown"
+    key_lines = format_key(event, key_dump)
+    for line in key_lines:
+        print(line)
 
     #
     # Decode packet only if there is data
@@ -269,29 +405,52 @@ def print_event(ctx, data, size):
         print(re.sub('^', ' ' * 4, packet.show(dump=True), flags=re.MULTILINE))
 
     if options.pcap is not None:
-        wrpcap(options.pcap, packet, append=True, snaplen=options.packet_size)
+        try:
+            if pcap_writer is None:
+                pcap_writer = PcapNgWriter(options.pcap)
+
+            comment = "cpu={} comm={} pid={} upcall_type={} result={}". format(
+                event.cpu, event.comm.decode("utf-8"), event.pid,
+                event.upcall_type, event.result)
+
+            if options.flow_key_decode != 'none':
+                comment = comment + "\n" + "\n".join(key_lines)
+
+            if scapy_supports_pcap_iface:
+                packet.sniffed_on = "{} ({})".format(port, dp)
+            else:
+                comment = "iface={}({}) ".format(port, dp) + comment
+
+            packet.comment = comment
+            pcap_writer.write(packet)
+        except NameError:  # PcapNgWriter not found
+            wrpcap(options.pcap, packet, append=True,
+                   snaplen=options.packet_size)
 
 
 #
 # decode_nlm()
 #
-def decode_nlm(msg, indent=4, dump=True):
+def decode_nlm(msg, indent=4):
     bytes_left = len(msg)
     result = {}
+    dump = []
 
     while bytes_left:
         if bytes_left < 4:
-            if dump:
-                print("{}WARN: decode truncated; can't read header".format(
-                    ' ' * indent))
+            dump.append(
+                "{}WARN: decode truncated; can't read header".format(
+                    " " * indent
+                )
+            )
             break
 
         nla_len, nla_type = struct.unpack("=HH", msg[:4])
 
         if nla_len < 4:
-            if dump:
-                print("{}WARN: decode truncated; nla_len < 4".format(
-                    ' ' * indent))
+            dump.append(
+                "{}WARN: decode truncated; nla_len < 4".format(" " * indent)
+            )
             break
 
         nla_data = msg[4:nla_len]
@@ -303,16 +462,19 @@ def decode_nlm(msg, indent=4, dump=True):
         else:
             result[get_ovs_key_attr_str(nla_type)] = nla_data
 
-        if dump:
-            print("{}nla_len {}, nla_type {}[{}], data: {}{}".format(
+        dump.append(
+            "{}nla_len {}, nla_type {}[{}], data: {}{}".format(
                 ' ' * indent, nla_len, get_ovs_key_attr_str(nla_type),
                 nla_type,
-                "".join("{:02x} ".format(b) for b in nla_data), trunc))
+                "".join("{:02x} ".format(b) for b in nla_data), trunc)
+        )
 
         if trunc != "":
-            if dump:
-                print("{}WARN: decode truncated; nla_len > msg_len[{}] ".
-                      format(' ' * indent, bytes_left))
+            dump.append(
+                "{}WARN: decode truncated; nla_len > msg_len[{}] ".format(
+                    " " * indent, bytes_left
+                )
+            )
             break
 
         # update next offset, but make sure it's aligned correctly
@@ -320,7 +482,7 @@ def decode_nlm(msg, indent=4, dump=True):
         msg = msg[next_offset:]
         bytes_left -= next_offset
 
-    return result
+    return result, dump
 
 
 #
@@ -405,6 +567,9 @@ def main():
     #
     global b
     global options
+    global dp_map
+
+    dp_map = DpPortMapping()
 
     #
     # Argument parsing
@@ -439,8 +604,33 @@ def main():
     parser.add_argument("-w", "--pcap", metavar="PCAP_FILE",
                         help="Write upcall packets to specified pcap file.",
                         type=str, default=None)
+    parser.add_argument("-r", "--result",
+                        help="Display only events with the given result, "
+                        "default: any",
+                        choices=["error", "ok", "any"], default="any")
 
     options = parser.parse_args()
+
+    #
+    # Check if current kernel supports error reporting.
+    #
+    tracefs_paths = ("/sys/kernel/debug/tracing/", "/sys/kernel/tracing/")
+    upcall_tp_found = False
+    for tracefs in tracefs_paths:
+        if exists(join(tracefs, "events/openvswitch/ovs_dp_upcall")):
+            upcall_tp_found = True
+            break
+
+    if not upcall_tp_found:
+        if options.result == "error":
+            print("ERROR: Monitoring error upcalls is not supported by the "
+                  "running kernel (or the tracefs is not mounted).")
+            sys.exit(-1)
+        if options.result == "any":
+            print("WARN: Monitoring error upcalls is not supported by the "
+                  "running kernel (or the tracefs is not mounted). "
+                  "Only successful ones will be monitored.")
+            options.result = "ok"
 
     #
     # Find the PID of the ovs-vswitchd daemon if not specified.
@@ -473,20 +663,23 @@ def main():
     #
     # Attach the usdt probe
     #
-    u = USDT(pid=int(options.pid))
-    try:
-        u.enable_probe(probe="recv_upcall", fn_name="do_trace")
-    except USDTException as e:
-        print("ERROR: {}"
-              "ovs-vswitchd!".format(
-                  (re.sub('^', ' ' * 7, str(e), flags=re.MULTILINE)).strip().
-                  replace("--with-dtrace or --enable-dtrace",
-                          "--enable-usdt-probes")))
-        sys.exit(-1)
+    usdt = []
+    if options.result in ["ok", "any"]:
+        u = USDT(pid=int(options.pid))
+        try:
+            u.enable_probe(probe="recv_upcall", fn_name="do_trace")
+            usdt.append(u)
+        except USDTException as e:
+            print("ERROR: {}"
+                  "ovs-vswitchd!".format(
+                      (re.sub('^', ' ' * 7, str(e), flags=re.MULTILINE)).
+                      strip().replace("--with-dtrace or --enable-dtrace",
+                                      "--enable-usdt-probes")))
+            sys.exit(-1)
 
     #
     # Uncomment to see how arguments are decoded.
-    #   print(u.get_text())
+    #       print(u.get_text())
     #
 
     #
@@ -496,15 +689,19 @@ def main():
     source = source.replace("<MAX_KEY_VAL>", str(options.flow_key_size))
     source = source.replace("<BUFFER_PAGE_CNT>",
                             str(options.buffer_page_count))
+    source = source.replace("<INSTALL_OVS_UPCALL_RECV_PROBE>", "1"
+                            if options.result in ["ok", "any"] else "0")
+    source = source.replace("<INSTALL_OVS_UPCALL_DROP_PROBE>", "1"
+                            if options.result in ["error", "any"] else "0")
 
-    b = BPF(text=source, usdt_contexts=[u], debug=options.debug)
+    b = BPF(text=source, usdt_contexts=usdt, debug=options.debug)
 
     #
     # Print header
     #
-    print("{:<18} {:<4} {:<16} {:<10} {:<32} {:<4} {:<10} {:<10}".format(
-        "TIME", "CPU", "COMM", "PID", "DPIF_NAME", "TYPE", "PKT_LEN",
-        "FLOW_KEY_LEN"))
+    print("{:<18} {:<4} {:<16} {:<10} {:<40} {:<4} {:<10} {:<12} {:<8}".format(
+        "TIME", "CPU", "COMM", "PID", "PORT_NAME", "TYPE", "PKT_LEN",
+        "FLOW_KEY_LEN", "RESULT"))
 
     #
     # Dump out all events
@@ -513,7 +710,6 @@ def main():
     while 1:
         try:
             b.ring_buffer_poll()
-            time.sleep(0.5)
         except KeyboardInterrupt:
             break
 
