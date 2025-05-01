@@ -44,6 +44,7 @@ create_netns_link () {
 }
 
 delete_netns_link () {
+    # shellcheck disable=SC2317
     rm -f /var/run/netns/"$PID"
 }
 
@@ -51,9 +52,9 @@ get_port_for_container_interface () {
     CONTAINER="$1"
     INTERFACE="$2"
 
-    PORT=`ovs_vsctl --data=bare --no-heading --columns=name find interface \
+    PORT=$(ovs_vsctl --data=bare --no-heading --columns=name find interface \
              external_ids:container_id="$CONTAINER"  \
-             external_ids:container_iface="$INTERFACE"`
+             external_ids:container_iface="$INTERFACE")
     if [ -z "$PORT" ]; then
         echo >&2 "$UTIL: Failed to find any attached port" \
                  "for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
@@ -75,19 +76,23 @@ add_port () {
     while [ $# -ne 0 ]; do
         case $1 in
             --ipaddress=*)
-                ADDRESS=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                ADDRESS=$(expr X"$1" : 'X[^=]*=\(.*\)')
                 shift
                 ;;
             --macaddress=*)
-                MACADDRESS=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                MACADDRESS=$(expr X"$1" : 'X[^=]*=\(.*\)')
                 shift
                 ;;
             --gateway=*)
-                GATEWAY=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                GATEWAY=$(expr X"$1" : 'X[^=]*=\(.*\)')
                 shift
                 ;;
             --mtu=*)
-                MTU=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                MTU=$(expr X"$1" : 'X[^=]*=\(.*\)')
+                shift
+                ;;
+            --safe)
+                SAFE=1
                 shift
                 ;;
             *)
@@ -98,8 +103,8 @@ add_port () {
     done
 
     # Check if a port is already attached for the given container and interface
-    PORT=`get_port_for_container_interface "$CONTAINER" "$INTERFACE" \
-            2>/dev/null`
+    PORT=$(get_port_for_container_interface "$CONTAINER" "$INTERFACE" \
+            2>/dev/null)
     if [ -n "$PORT" ]; then
         echo >&2 "$UTIL: Port already attached" \
                  "for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
@@ -112,34 +117,85 @@ add_port () {
         exit 1
     fi
 
-    if PID=`docker inspect -f '{{.State.Pid}}' "$CONTAINER"`; then :; else
+    if PID=$(docker inspect -f '{{.State.Pid}}' "$CONTAINER"); then :; else
         echo >&2 "$UTIL: Failed to get the PID of the container"
         exit 1
     fi
 
     create_netns_link
+    
+    # Create a veth pair with human-readable names.
+    # We want the names to include the container and interface names.
+    # Linux limits interface names to 15 characters.
+    # We reserve 2 characters for the suffix ("-h" or "-c"), leaving 13.
+    # If possible, build the base as "<container_part>-<INTERFACE>".
+    if [ -n "$SAFE" ]; then
+        # Use original behavior with a random hex string.
+        ID=$(uuidgen | sed 's/-//g')
+        PORTNAME="${ID:0:13}"
+        ip link add "${PORTNAME}_l" type veth peer name "${PORTNAME}_c"
+    else
+        # Create a veth pair with human-readable names.
+        if [ ${#INTERFACE} -le 12 ]; then
+            available=$((12 - ${#INTERFACE}))
+        else
+            available=0
+        fi
 
-    # Create a veth pair.
-    ID=`uuidgen | sed 's/-//g'`
-    PORTNAME="${ID:0:13}"
-    ip link add "${PORTNAME}_l" type veth peer name "${PORTNAME}_c"
+        if [ $available -gt 0 ]; then
+            container_part=${CONTAINER:0:$available}
+            PORTNAME_BASE="${container_part}-${INTERFACE}"
+        else
+            PORTNAME_BASE="${INTERFACE}"
+        fi
 
-    # Add one end of veth to OVS bridge.
-    if ovs_vsctl --may-exist add-port "$BRIDGE" "${PORTNAME}_l" \
-       -- set interface "${PORTNAME}_l" \
-       external_ids:container_id="$CONTAINER" \
-       external_ids:container_iface="$INTERFACE"; then :; else
-        echo >&2 "$UTIL: Failed to add "${PORTNAME}_l" port to bridge $BRIDGE"
-        ip link delete "${PORTNAME}_l"
-        exit 1
+        HOST_PORT=$(echo "${PORTNAME_BASE}-h" | cut -c1-15)
+        CONT_PORT=$(echo "${PORTNAME_BASE}-c" | cut -c1-15)
+
+         # Deconflict in case the generated port name already exists.
+         counter=1
+         while ip link show "$HOST_PORT" &>/dev/null; do
+             HOST_PORT=$(echo "${PORTNAME_BASE}${counter}-h" | cut -c1-15)
+             CONT_PORT=$(echo "${PORTNAME_BASE}${counter}-c" | cut -c1-15)
+             counter=$((counter+1))
+         done
+
+        ip link add "${HOST_PORT}" type veth peer name "${CONT_PORT}"
     fi
 
-    ip link set "${PORTNAME}_l" up
+    # Add one end of veth to OVS bridge.
+    if [ -n "$SAFE" ]; then
+        if ovs_vsctl --may-exist add-port "$BRIDGE" "${PORTNAME}_l" \
+           -- set interface "${PORTNAME}_l" \
+           external_ids:container_id="$CONTAINER" \
+           external_ids:container_iface="$INTERFACE"; then :; else
+            echo >&2 "$UTIL: Failed to add port ${PORTNAME}_l to bridge $BRIDGE"
+            ip link delete "${PORTNAME}_l"
+            exit 1
+        fi
+        ip link set "${PORTNAME}_l" up
+    else
+        if ovs_vsctl --may-exist add-port "$BRIDGE" "${HOST_PORT}" \
+           -- set interface "${HOST_PORT}" \
+           external_ids:container_id="$CONTAINER" \
+           external_ids:container_iface="$INTERFACE"; then :; else
+            echo >&2 "$UTIL: Failed to add port ${HOST_PORT} to bridge $BRIDGE"
+            ip link delete "${HOST_PORT}"
+            exit 1
+        fi
+        ip link set "${HOST_PORT}" up
+    fi
 
-    # Move "${PORTNAME}_c" inside the container and changes its name.
-    ip link set "${PORTNAME}_c" netns "$PID"
-    ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
-    ip netns exec "$PID" ip link set "$INTERFACE" up
+    # Move the container side interface and change its name
+    if [ -n "$SAFE" ]; then
+        ip link set "${PORTNAME}_c" netns "$PID"
+        ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
+        ip netns exec "$PID" ip link set "$INTERFACE" up
+    else
+        ip link set "${CONT_PORT}" netns "$PID"
+        ip netns exec "$PID" ip link set dev "${CONT_PORT}" name "$INTERFACE"
+        ip netns exec "$PID" ip link set "$INTERFACE" up
+    fi
 
     if [ -n "$MTU" ]; then
         ip netns exec "$PID" ip link set dev "$INTERFACE" mtu "$MTU"
@@ -168,7 +224,7 @@ del_port () {
         exit 1
     fi
 
-    PORT=`get_port_for_container_interface "$CONTAINER" "$INTERFACE"`
+    PORT=$(get_port_for_container_interface "$CONTAINER" "$INTERFACE")
     if [ -z "$PORT" ]; then
         exit 1
     fi
@@ -186,8 +242,8 @@ del_ports () {
         exit 1
     fi
 
-    PORTS=`ovs_vsctl --data=bare --no-heading --columns=name find interface \
-             external_ids:container_id="$CONTAINER"`
+    PORTS=$(ovs_vsctl --data=bare --no-heading --columns=name find interface \
+             external_ids:container_id="$CONTAINER")
     if [ -z "$PORTS" ]; then
         exit 0
     fi
@@ -209,7 +265,7 @@ set_vlan () {
         exit 1
     fi
 
-    PORT=`get_port_for_container_interface "$CONTAINER_ID" "$INTERFACE"`
+    PORT=$(get_port_for_container_interface "$CONTAINER_ID" "$INTERFACE")
     if [ -z "$PORT" ]; then
         exit 1
     fi
@@ -224,12 +280,14 @@ usage: ${UTIL} COMMAND
 Commands:
   add-port BRIDGE INTERFACE CONTAINER [--ipaddress="ADDRESS"]
                     [--gateway=GATEWAY] [--macaddress="MACADDRESS"]
-                    [--mtu=MTU]
+                    [--mtu=MTU] [--safe]
                     Adds INTERFACE inside CONTAINER and connects it as a port
                     in Open vSwitch BRIDGE. Optionally, sets ADDRESS on
                     INTERFACE. ADDRESS can include a '/' to represent network
                     prefix length. Optionally, sets a GATEWAY, MACADDRESS
-                    and MTU.  e.g.:
+                    and MTU. The 'safe' option uses the original randomly-
+                    generated OVS port name behavior.
+                    e.g.:
                     ${UTIL} add-port br-int eth1 c474a0e2830e
                     --ipaddress=192.168.1.2/24 --gateway=192.168.1.1
                     --macaddress="a2:c3:0d:49:7f:f8" --mtu=1450
@@ -249,7 +307,7 @@ Options:
 EOF
 }
 
-UTIL=$(basename $0)
+UTIL=$(basename "$0")
 search_path ovs-vsctl
 search_path docker
 search_path uuidgen
